@@ -2,10 +2,14 @@ import os
 import threading
 from tkinter import filedialog, Tk, messagebox, Toplevel, Label, Text, Button, END, StringVar, OptionMenu
 from datetime import datetime
+import tempfile
+import shutil
 # Импортируем новые функции из extractor.py
 from utils.extractor import extract_renpy_translatable_data, strip_tags, restore_tags 
 from utils.replacer import replace_lines_in_rpy
 from utils.deepl_translator import translate_single # Импортируем translate_single напрямую
+from utils.extract_rpa import extract_rpa
+from utils.game_detector import detect_game_structure, should_translate_file
 
 # Добавление поддерживаемых DeepL языков
 DEEPL_TARGET_LANGS = {
@@ -60,11 +64,30 @@ def get_api_key_and_lang(root):
     root.wait_window(win)
     return result["key"], result["lang"]
 
+def extract_rpa_archives(game_dir, temp_dir, status_callback):
+    """Извлечение всех .rpa архивов в временную папку"""
+    extracted_count = 0
+    
+    for file in os.listdir(game_dir):
+        if file.endswith('.rpa'):
+            rpa_path = os.path.join(game_dir, file)
+            status_callback(f"Распаковка архива: {file}...")
+            
+            try:
+                files_extracted = extract_rpa(rpa_path, temp_dir)
+                extracted_count += files_extracted
+                print(f"Извлечено {files_extracted} файлов из {file}")
+            except Exception as e:
+                print(f"Ошибка при извлечении {file}: {e}")
+                status_callback(f"Ошибка при распаковке {file}: {e}")
+    
+    return extracted_count
+
 def main():
     root = Tk()
     root.withdraw() # Скрываем основное окно Tkinter
 
-    messagebox.showinfo("Переводчик Ren'Py", "Выберите папку с распакованной Ren'Py-игрой (.rpy файлы).")
+    messagebox.showinfo("Переводчик Ren'Py", "Выберите папку с Ren'Py-игрой (с .rpy файлами или .rpa архивами).")
     game_dir = filedialog.askdirectory(title="Выбор папки игры")
     if not game_dir:
         messagebox.showwarning("Отмена", "Папка не выбрана. Выход.")
@@ -81,33 +104,83 @@ def main():
     root.update()
 
     def work():
+        temp_dir = None
         try:
-            # 1. Создание папки для бэкапа
+            # 1. Определяем структуру игры
+            root.after(0, status_text.set, "Анализ структуры игры...")
+            game_structure = detect_game_structure(game_dir)
+            
+            working_dir = game_dir
+            is_temp_dir = False
+            
+            # 2. Если найдены .rpa архивы, распаковываем их
+            if game_structure['has_rpa']:
+                root.after(0, status_text.set, "Обнаружены .rpa архивы. Распаковка...")
+                temp_dir = tempfile.mkdtemp(prefix="renpy_translator_")
+                is_temp_dir = True
+                
+                def status_callback(msg):
+                    root.after(0, status_text.set, msg)
+                
+                extracted_count = extract_rpa_archives(game_dir, temp_dir, status_callback)
+                
+                if extracted_count == 0:
+                    root.after(0, lambda: [progress_win.destroy(),
+                        messagebox.showwarning("Ошибка", "Не удалось извлечь файлы из .rpa архивов.")])
+                    return
+                
+                working_dir = temp_dir
+                root.after(0, status_text.set, f"Распаковано {extracted_count} файлов.")
+            
+            # 3. Создание папки для бэкапа
             backup_root_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups")
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             current_backup_dir = os.path.join(backup_root_dir, f"backup_{timestamp}")
             os.makedirs(current_backup_dir, exist_ok=True)
             root.after(0, status_text.set, f"Создание резервной копии в: {os.path.basename(current_backup_dir)}...")
             
-            # 2. Извлечение строк из всех .rpy файлов
+            # 4. Поиск и фильтрация .rpy файлов
+            root.after(0, status_text.set, "Поиск .rpy файлов для перевода...")
+            
+            all_rpy_files = []
+            for root_dir, _, files in os.walk(working_dir):
+                for file in files:
+                    if file.endswith(".rpy"):
+                        all_rpy_files.append(os.path.join(root_dir, file))
+            
+            if not all_rpy_files:
+                root.after(0, lambda: [progress_win.destroy(),
+                    messagebox.showinfo("Нет файлов", "В выбранной папке не найдено .rpy файлов.")])
+                return
+            
+            # Фильтрация файлов - оставляем только те, что содержат переводимый текст
+            translatable_files = []
+            skipped_files = []
+            
+            for rpy_file_path in all_rpy_files:
+                file_name = os.path.basename(rpy_file_path)
+                root.after(0, status_text.set, f"Анализ файла: {file_name}...")
+                
+                if should_translate_file(rpy_file_path):
+                    translatable_files.append(rpy_file_path)
+                else:
+                    skipped_files.append(rpy_file_path)
+            
+            root.after(0, status_text.set, f"Найдено файлов для перевода: {len(translatable_files)}, пропущено: {len(skipped_files)}")
+            
+            if not translatable_files:
+                root.after(0, lambda: [progress_win.destroy(),
+                    messagebox.showinfo("Нет файлов", "Не найдено .rpy файлов с переводимым текстом.")])
+                return
+            
+            # 5. Извлечение строк из отфильтрованных .rpy файлов
             root.after(0, status_text.set, "Извлечение строк для перевода...")
             
             all_extracted_data = [] # Список всех извлеченных элементов со всех файлов
             extracted_data_per_file = {} # Словарь {путь_к_файлу: список_извлеченных_данных_из_этого_файла}
 
-            rpy_files_found = []
-            for root_dir, _, files in os.walk(game_dir):
-                for file in files:
-                    if file.endswith(".rpy"):
-                        rpy_files_found.append(os.path.join(root_dir, file))
-            
-            if not rpy_files_found:
-                root.after(0, lambda: [progress_win.destroy(),
-                    messagebox.showinfo("Нет файлов", "В выбранной папке не найдено .rpy файлов.")])
-                return
-
             total_lines_to_translate = 0
-            for rpy_file_path in rpy_files_found:
+            for rpy_file_path in translatable_files:
                 root.after(0, status_text.set, f"Обработка файла: {os.path.basename(rpy_file_path)}...")
                 try:
                     with open(rpy_file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -130,7 +203,7 @@ def main():
                     messagebox.showinfo("Нет строк", "В .rpy файлах не найдено строк для перевода.")])
                 return
 
-            # 3. Перевод строк
+            # 6. Перевод строк
             translations_map = {} # Словарь {очищенный_оригинальный_текст: переведенный_текст_с_тегами}
             error_log_entries = [] # Для более детального лога ошибок перевода
             
@@ -148,20 +221,58 @@ def main():
                 if translated_text_with_tags == "[ОШИБКА ПЕРЕВОДА]":
                     error_log_entries.append(f"Ошибка перевода строки (файл: {os.path.basename(item['file_path'])}, строка: {item['line_number']}):\nОригинал: {item['original_line'].strip()}\nТекст для перевода: {text_to_translate_cleaned}\nПеревод: {translated_text_with_tags}\n")
 
-            # 4. Замена строк
-            root.after(0, status_text.set, "Замена строк в файлах Ren'Py и создание бэкапов...")
-            replace_lines_in_rpy(game_dir, extracted_data_per_file, translations_map, backup_dir=current_backup_dir)
+            # 7. Определяем целевую папку для сохранения переведённых файлов
+            if is_temp_dir:
+                # Если работали с .rpa, создаём папку для переведённых файлов
+                translated_dir = os.path.join(game_dir, f"translated_{timestamp}")
+                os.makedirs(translated_dir, exist_ok=True)
+                
+                # Копируем структуру папок и переведённые файлы
+                root.after(0, status_text.set, "Копирование переведённых файлов...")
+                
+                for rpy_file_path in extracted_data_per_file.keys():
+                    relative_path = os.path.relpath(rpy_file_path, working_dir)
+                    target_path = os.path.join(translated_dir, relative_path)
+                    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                
+                # Заменяем строки в временных файлах
+                replace_lines_in_rpy(working_dir, extracted_data_per_file, translations_map, backup_dir=None)
+                
+                # Копируем переведённые файлы в целевую папку
+                for rpy_file_path in extracted_data_per_file.keys():
+                    relative_path = os.path.relpath(rpy_file_path, working_dir)
+                    target_path = os.path.join(translated_dir, relative_path)
+                    shutil.copy2(rpy_file_path, target_path)
+                
+                final_message = f"Перевод завершён.\nПереведённые файлы сохранены в: {os.path.basename(translated_dir)}"
+            else:
+                # Если работали с уже распакованной игрой
+                root.after(0, status_text.set, "Замена строк в файлах Ren'Py и создание бэкапов...")
+                replace_lines_in_rpy(working_dir, extracted_data_per_file, translations_map, backup_dir=current_backup_dir)
+                final_message = f"Перевод завершён.\nРезервная копия: {os.path.basename(current_backup_dir)}"
 
-            # 5. Сохранение лога
+            # 8. Сохранение лога
             logname = f"лог_перевода_{timestamp}.txt"
             fullpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), logname)
             with open(fullpath, "w", encoding="utf-8") as f:
                 f.write(f"--- Лог перевода Ren'Py игры ---\n")
                 f.write(f"Дата и время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"Папка игры: {game_dir}\n")
+                f.write(f"Исходная папка игры: {game_dir}\n")
+                f.write(f"Структура игры: {'RPA архивы' if game_structure['has_rpa'] else 'Распакованные файлы'}\n")
                 f.write(f"Целевой язык: {target_lang}\n")
+                f.write(f"Всего .rpy файлов найдено: {len(all_rpy_files)}\n")
+                f.write(f"Файлов для перевода: {len(translatable_files)}\n")
+                f.write(f"Пропущено файлов: {len(skipped_files)}\n")
                 f.write(f"Всего строк для перевода: {total_lines_to_translate}\n")
-                f.write(f"Местоположение резервной копии: {current_backup_dir}\n\n")
+                if not is_temp_dir:
+                    f.write(f"Местоположение резервной копии: {current_backup_dir}\n")
+                f.write("\n")
+                
+                if skipped_files:
+                    f.write("--- Пропущенные файлы (системные/без переводимого текста) ---\n")
+                    for skipped_file in skipped_files:
+                        f.write(f"{os.path.relpath(skipped_file, working_dir)}\n")
+                    f.write("\n")
                 
                 f.write("--- Детали перевода ---\n\n")
                 for item in all_extracted_data:
@@ -178,12 +289,21 @@ def main():
                         f.write(entry + "\n")
 
             root.after(0, lambda: [progress_win.destroy(),
-                messagebox.showinfo("Готово", f"Перевод завершён. Лог: {logname}\nРезервная копия: {os.path.basename(current_backup_dir)}")])
+                messagebox.showinfo("Готово", f"{final_message}\nЛог: {logname}")])
+                
         except Exception as e:
             root.after(0, lambda: [progress_win.destroy(),
                 messagebox.showerror("Ошибка", f"Произошла непредвиденная ошибка: {e}")])
             import traceback
             traceback.print_exc() # Вывод полного traceback в консоль для отладки
+        finally:
+            # Очистка временных файлов
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                    print(f"Временная папка {temp_dir} удалена.")
+                except Exception as e:
+                    print(f"Не удалось удалить временную папку {temp_dir}: {e}")
 
     threading.Thread(target=work).start()
     root.mainloop()
